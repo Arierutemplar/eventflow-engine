@@ -1,0 +1,36 @@
+{
+  "name": "eventflow-engine",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "npm@10.2.0",
+  "workspaces": [
+    "eventflow-engine/apps/*",
+    "eventflow-engine/packages/*"
+  ],
+  "scripts": {
+    "install:project": "npm install --prefix eventflow-engine",
+    "build": "npm run build --workspaces",
+    "dev": "npm run dev --workspace=@eventflow/event-workers",
+    "dev:gateway": "npm run dev --workspace=@eventflow/api-gateway",
+    "start:gateway": "npm run start --workspace=@eventflow/api-gateway",
+    "start": "npm run start --workspace=@eventflow/event-workers",
+    "start:consumer": "npm run start:consumer --workspace=@eventflow/event-workers",
+    "docker:db": "docker compose -f eventflow-engine/docker-compose.yml up -d",
+    "test": "npm --prefix eventflow-engine test",
+    "test:integration": "npm --prefix eventflow-engine run test:integration",
+    "db:studio": "npx prisma studio --schema=eventflow-engine/packages/database/prisma/schema.prisma",
+    "db:generate": "npx prisma generate --schema=eventflow-engine/packages/database/prisma/schema.prisma",
+    "db:migrate": "npx prisma migrate dev --name init --schema=eventflow-engine/packages/database/prisma/schema.prisma",
+    "db:seed": "npx tsx eventflow-engine/scripts/seed.ts",
+    "stress:api": "tsx scripts/stress-test.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "autocannon": "^8.0.0",
+    "prisma": "^6.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.7.2"
+  }
+}
