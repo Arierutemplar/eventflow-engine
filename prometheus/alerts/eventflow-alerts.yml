@@ -1,0 +1,79 @@
+groups:
+  - name: eventflow-reliability
+    interval: 15s
+    rules:
+      - alert: EventflowCircuitBreakerOpen
+        expr: eventflow_circuit_breaker_state{state="open"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          component: resilience
+        annotations:
+          summary: "Circuit breaker abierto"
+          description: "El circuit breaker de {{ $labels.service }} permanece abierto durante más de un minuto."
+
+      - alert: EventflowWorkerErrorRateHigh
+        expr: |
+          (
+            sum(rate(eventflow_events_errors_total[1m]))
+            /
+            clamp_min(
+              sum(rate(eventflow_events_processed_total[1m]))
+              + sum(rate(eventflow_events_errors_total[1m])),
+              0.001
+            )
+          ) > 0.10
+        for: 1m
+        labels:
+          severity: critical
+          component: event-workers
+        annotations:
+          summary: "Tasa de errores alta en event-workers"
+          description: "La tasa de errores de event-workers supera el 10% durante un minuto."
+
+      - alert: EventflowNotificationErrorRateHigh
+        expr: |
+          (
+            sum(rate(eventflow_notification_events_errors_total[1m]))
+            /
+            clamp_min(
+              sum(rate(eventflow_notification_events_processed_total[1m]))
+              + sum(rate(eventflow_notification_events_errors_total[1m])),
+              0.001
+            )
+          ) > 0.10
+        for: 1m
+        labels:
+          severity: critical
+          component: notification-service
+        annotations:
+          summary: "Tasa de errores alta en notification-service"
+          description: "La tasa de errores de notification-service supera el 10% durante un minuto."
+
+  - name: eventflow-queues
+    interval: 15s
+    rules:
+      - alert: EventflowDeadLetterQueueNotEmpty
+        expr: sum(rabbitmq_queue_messages_ready{queue="events_queue_dlq"}) > 0
+        for: 1m
+        labels:
+          severity: warning
+          component: rabbitmq
+        annotations:
+          summary: "La Dead Letter Queue contiene mensajes"
+          description: "events_queue_dlq contiene {{ $value }} mensajes listos para inspección."
+
+      - alert: EventflowRetryQueueSaturated
+        expr: |
+          sum(
+            rabbitmq_queue_messages_ready{
+              queue=~"events_retry_queue(_10s|_20s)?"
+            }
+          ) > 100
+        for: 2m
+        labels:
+          severity: warning
+          component: rabbitmq
+        annotations:
+          summary: "Colas de reintento saturadas"
+          description: "Las colas de reintento contienen {{ $value }} mensajes listos."

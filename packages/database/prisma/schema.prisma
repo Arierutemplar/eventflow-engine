@@ -1,0 +1,104 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Order {
+  id        String   @id @default(uuid())
+  customerId String
+  total     Int
+  status    String   @default("PENDING")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([customerId, createdAt])
+  @@index([status, createdAt])
+}
+
+model Product {
+  id        String   @id @default(uuid())
+  name      String
+  price     Int
+  status    String   @default("ACTIVE")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, createdAt])
+  @@index([name])
+}
+
+// Registro de eventos ingresados
+model Event {
+  id        String   @id @default(uuid())
+  type      String
+  payload   Json
+  status    String   @default("PENDING") // PENDING, PROCESSED, FAILED
+  attempts  Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, createdAt])
+  @@index([type, createdAt])
+}
+
+// Patrón Transactional Outbox (Eventos pendientes por publicar)
+model OutboxMessage {
+  id        String    @id @default(uuid())
+  eventType String
+  payload   Json
+  published Boolean   @default(false)
+  createdAt DateTime  @default(now())
+  sentAt    DateTime?
+
+  @@index([published, createdAt])
+  @@index([eventType, createdAt])
+}
+
+// Control de Idempotencia por clave única
+model IdempotencyRecord {
+  id        String    @id @default(uuid())
+  eventId   String?   @unique
+  key       String?   @unique
+  status    String    @default("PROCESSING")
+  result    Json?
+  response  Json?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([eventId])
+  @@index([status, updatedAt])
+}
+
+model OutboxEvent {
+  id          String   @id @default(uuid())
+  aggregateId String
+  eventType   String
+  payload     Json
+  status      String   @default("PENDING")
+  createdAt   DateTime @default(now())
+
+  @@index([status, createdAt])
+  @@index([aggregateId, createdAt])
+  @@index([eventType, createdAt])
+}
+
+model DeadLetterAudit {
+  id              String   @id @default(uuid())
+  eventId         String?
+  eventType       String?
+  routingKey      String
+  sourceQueue     String
+  headers         Json?
+  payload         Json
+  errorMessage    String?
+  failedAttempts  Int?
+  createdAt       DateTime @default(now())
+
+  @@index([eventId, createdAt])
+  @@index([eventType, createdAt])
+  @@index([createdAt])
+}

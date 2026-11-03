@@ -4,13 +4,14 @@ import { randomUUID } from "node:crypto";
 
 const targetUrl =
   process.env.TARGET_URL ??
-  `http://localhost:${process.env.PORT ?? "3002"}/api/users`;
+  `http://localhost:${process.env.PORT ?? "3002"}/products`;
 const connections = parsePositiveInteger("CONNECTIONS", 50);
 const duration = parsePositiveInteger("DURATION", 30);
 
-type CreateUserPayload = {
-  email: string;
+type CreateProductPayload = {
   name: string;
+  price: number;
+  status: string;
 };
 
 function parsePositiveInteger(name: string, defaultValue: number): number {
@@ -21,11 +22,11 @@ function parsePositiveInteger(name: string, defaultValue: number): number {
   return value;
 }
 
-function createUserPayload(): string {
-  const id = randomUUID();
-  const payload: CreateUserPayload = {
-    email: `user-${Date.now()}-${Math.random().toString(36).slice(2)}@example.com`,
-    name: `Stress User ${id}`,
+function createProductPayload(): string {
+  const payload: CreateProductPayload = {
+    name: `Stress Product ${randomUUID()}`,
+    price: Math.floor(Math.random() * 10_000) + 1,
+    status: "ACTIVE",
   };
   return JSON.stringify(payload);
 }
@@ -36,7 +37,7 @@ function setupRequest(request: Request): Request {
     ...request.headers,
     "content-type": "application/json",
   };
-  request.body = createUserPayload();
+  request.body = createProductPayload();
   return request;
 }
 

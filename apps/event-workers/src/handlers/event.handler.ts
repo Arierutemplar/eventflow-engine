@@ -1,0 +1,5 @@
+import { processEventPayload } from "../services/processing.service.js";
+
+export async function handleEvent(payload: unknown): Promise<void> {
+  await processEventPayload(payload);
+}

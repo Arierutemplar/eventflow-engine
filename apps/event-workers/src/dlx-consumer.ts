@@ -1,0 +1,140 @@
+import "./tracing.js";
+import amqp, { type ConsumeMessage, type Channel, type ChannelModel } from "amqplib";
+import type { Prisma } from "@prisma/client";
+import { database } from "@eventflow/database";
+import {
+  EVENTS_DLX_EXCHANGE,
+  EVENTS_DLQ,
+  EVENTS_EXCHANGE,
+} from "@eventflow/event-bus";
+import { logger } from "@eventflow/common";
+import { extractTraceContext, startConsumerSpan, shutdownTracing } from "./tracing.js";
+
+const rabbitUrl = process.env.RABBITMQ_URL ?? "amqp://localhost:5672";
+
+function getHeaders(message: ConsumeMessage): Record<string, unknown> {
+  const headers = message.properties.headers;
+  return typeof headers === "object" && headers !== null
+    ? { ...(headers as Record<string, unknown>) }
+    : {};
+}
+
+function getAttempts(headers: Record<string, unknown>): number | null {
+  const value = headers["x-retry-count"];
+  if (typeof value === "number" && Number.isInteger(value)) return value;
+  if (typeof value === "string" && /^\d+$/.test(value)) return Number(value);
+  return null;
+}
+
+function getTraceparent(headers: Record<string, unknown>, payload: unknown): unknown {
+  if (typeof headers.traceparent === "string") return headers.traceparent;
+  if (typeof payload === "object" && payload !== null && "metadata" in payload) {
+    const metadata = payload.metadata;
+    if (typeof metadata === "object" && metadata !== null && "traceparent" in metadata) {
+      return metadata.traceparent;
+    }
+  }
+  return undefined;
+}
+
+function getString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+export async function startDlxConsumer(): Promise<{
+  connection: ChannelModel;
+  channel: Channel;
+}> {
+  const connection = await amqp.connect(rabbitUrl);
+  const channel = await connection.createChannel();
+  await channel.assertExchange(EVENTS_EXCHANGE, "topic", { durable: true });
+  await channel.assertExchange(EVENTS_DLX_EXCHANGE, "topic", { durable: true });
+  await channel.assertQueue(EVENTS_DLQ, {
+    durable: true,
+    arguments: { "x-queue-type": "quorum" },
+  });
+  await channel.bindQueue(EVENTS_DLQ, EVENTS_DLX_EXCHANGE, "#");
+
+  await channel.consume(
+    EVENTS_DLQ,
+    (message) => {
+      if (message) void handleDeadLetter(channel, message);
+    },
+    { noAck: false },
+  );
+  logger.info({ queue: EVENTS_DLQ }, "DLX consumer iniciado");
+  return { connection, channel };
+}
+
+async function handleDeadLetter(
+  channel: Channel,
+  message: ConsumeMessage,
+): Promise<void> {
+  let payload: unknown = {};
+  try {
+    payload = JSON.parse(message.content.toString()) as unknown;
+  } catch (error: unknown) {
+    logger.error({ err: error, queue: EVENTS_DLQ }, "Mensaje DLX con JSON inválido");
+  }
+
+  const headers = getHeaders(message);
+  const event = typeof payload === "object" && payload !== null
+    ? payload as Record<string, unknown>
+    : {};
+  const eventId = getString(event.eventId) ?? getString(event.id);
+  const eventType = getString(event.eventType);
+  const span = startConsumerSpan(
+    `event.dlx ${eventType ?? "unknown"}`,
+    extractTraceContext(getTraceparent(headers, event.payload)),
+  );
+
+  try {
+    logger.error(
+      {
+        eventId: eventId ?? null,
+        eventType: eventType ?? null,
+        queue: EVENTS_DLQ,
+        routingKey: message.fields.routingKey,
+        headers: headers as Prisma.InputJsonObject,
+        failedAttempts: getAttempts(headers),
+      },
+      "Evento enviado a la Dead Letter Queue",
+    );
+
+    await database.deadLetterAudit.create({
+      data: {
+        eventId: eventId ?? null,
+        eventType: eventType ?? null,
+        routingKey: message.fields.routingKey,
+        sourceQueue: EVENTS_DLQ,
+        headers: headers as Prisma.InputJsonObject,
+        payload: payload as Prisma.InputJsonValue,
+        errorMessage: getString(headers["x-error-message"]) ?? null,
+        failedAttempts: getAttempts(headers),
+      },
+    });
+    channel.ack(message);
+  } catch (error: unknown) {
+    logger.error({ err: error, eventId }, "No se pudo auditar el mensaje DLX");
+    channel.nack(message, false, true);
+  } finally {
+    span.end();
+  }
+}
+
+async function main(): Promise<void> {
+  const { connection } = await startDlxConsumer();
+  const shutdown = async (): Promise<void> => {
+    await connection.close();
+    await shutdownTracing();
+  };
+  process.once("SIGTERM", () => void shutdown());
+  process.once("SIGINT", () => void shutdown());
+}
+
+if (process.argv[1]?.endsWith("dlx-consumer.ts") || process.argv[1]?.endsWith("dlx-consumer.js")) {
+  main().catch((error: unknown) => {
+    logger.fatal({ err: error }, "Error fatal iniciando el consumidor DLX");
+    process.exitCode = 1;
+  });
+}

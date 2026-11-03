@@ -4,33 +4,54 @@
   "private": true,
   "packageManager": "npm@10.2.0",
   "workspaces": [
-    "eventflow-engine/apps/*",
-    "eventflow-engine/packages/*"
+    "apps/*",
+    "packages/*"
   ],
   "scripts": {
-    "install:project": "npm install --prefix eventflow-engine",
-    "build": "npm run build --workspaces",
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "start": "node --import ./dist/apps/api-gateway/src/tracing.js ./dist/apps/api-gateway/src/index.js",
+    "start:gateway": "npm run start --workspace=@eventflow/api-gateway",
+    "start:consumer": "npm run start:consumer --workspace=@eventflow/event-workers",
     "dev": "npm run dev --workspace=@eventflow/event-workers",
     "dev:gateway": "npm run dev --workspace=@eventflow/api-gateway",
-    "start:gateway": "npm run start --workspace=@eventflow/api-gateway",
-    "start": "npm run start --workspace=@eventflow/event-workers",
-    "start:consumer": "npm run start:consumer --workspace=@eventflow/event-workers",
-    "docker:db": "docker compose -f eventflow-engine/docker-compose.yml up -d",
-    "test": "npm --prefix eventflow-engine test",
-    "test:integration": "npm --prefix eventflow-engine run test:integration",
-    "db:studio": "npx prisma studio --schema=eventflow-engine/packages/database/prisma/schema.prisma",
-    "db:generate": "npx prisma generate --schema=eventflow-engine/packages/database/prisma/schema.prisma",
-    "db:migrate": "npx prisma migrate dev --name init --schema=eventflow-engine/packages/database/prisma/schema.prisma",
-    "db:seed": "npx tsx eventflow-engine/scripts/seed.ts",
-    "stress:api": "tsx scripts/stress-test.ts"
+    "dev:poller": "tsx watch ./apps/event-workers/src/index.ts",
+    "dev:worker": "tsx watch --import ./apps/event-workers/src/tracing.ts ./apps/event-workers/src/consumers/event.consumer.ts",
+    "dev:dlx": "tsx watch --import ./apps/event-workers/src/tracing.ts ./apps/event-workers/src/dlx-consumer.ts",
+    "dev:notifications": "npm run dev --workspace=@eventflow/notification-service",
+    "docker:db": "docker compose up -d postgres redis rabbitmq",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev --name init",
+    "db:push": "prisma db push",
+    "db:studio": "prisma studio",
+    "db:seed": "tsx scripts/seed.ts",
+    "load:test": "tsx scripts/load-test.ts",
+    "load:products": "tsx scripts/load-products.ts",
+    "stress:api": "tsx scripts/stress-test.ts",
+    "replay:dlx": "tsx scripts/replay-dlx.ts",
+    "test": "jest --runInBand",
+    "test:e2e": "dotenv -e .env.test -- jest --runInBand --runTestsByPath tests/integration/event-flow.e2e.test.ts apps/event-workers/src/__tests__/e2e/outbox-flow.e2e-spec.ts",
+    "test:integration": "dotenv -e .env.test -- prisma db push --skip-generate && dotenv -e .env.test -- jest --runInBand tests/integration"
+  },
+  "prisma": {
+    "schema": "packages/database/prisma/schema.prisma"
   },
   "engines": {
     "node": ">=20"
   },
   "devDependencies": {
+    "@types/autocannon": "^7.12.7",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^26.6.6",
     "autocannon": "^8.0.0",
+    "dotenv-cli": "^11.1.0",
+    "jest": "^30.5.2",
     "prisma": "^6.0.0",
+    "ts-jest": "^29.4.15",
     "tsx": "^4.23.15",
     "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.19.3"
   }
 }
