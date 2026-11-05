@@ -1,212 +1,199 @@
 # EventFlow Engine
 
-Plataforma de procesamiento de eventos **orientada a eventos (Event-Driven Architecture)** construida como monorepo TypeScript. Recibe peticiones HTTP, persiste el cambio de negocio y el evento en una misma transacción (patrón **Transactional Outbox**), y lo distribuye de forma asíncrona y fiable a través de **RabbitMQ** hacia consumidores idempotentes, con reintentos, *dead-letter queues*, métricas y trazas distribuidas.
+## Title & Executive Summary
 
-## Puntos fuertes
+EventFlow Engine is a TypeScript event-driven platform for production workloads that must accept writes under concurrency, survive broker or consumer failures, and keep a reliable audit of every domain event. An HTTP command commits the business row and its outbound event in one PostgreSQL transaction. A dedicated poller then publishes that event to RabbitMQ with publisher confirms. Independent consumers process the stream at least once, ignore duplicates, retry transient failures, and park poison messages on a dead-letter queue.
 
-| Característica | Cómo se implementa |
-|---|---|
-| **Entrega fiable (patrón Outbox)** | El evento se guarda en PostgreSQL junto al cambio de negocio en una sola transacción; un *Outbox Poller* lo publica en RabbitMQ después. Sin *dual writes* ni eventos perdidos. |
-| **Idempotencia** | Registros de idempotencia en PostgreSQL y, opcionalmente, en Redis (TTL configurable). Un mismo evento entregado varias veces se procesa una sola vez. |
-| **Procesamiento asíncrono** | API Gateway, Outbox Poller, consumidores y servicio de notificaciones son procesos independientes desacoplados por el broker. |
-| **Resiliencia** | Reintentos con *backoff* mediante colas TTL (5 s, 10 s, 20 s), DLX/DLQ con auditoría y *replay*, *Circuit Breaker* hacia la base de datos y *rate limiting* distribuido con Redis. |
-| **Escalabilidad** | Servicios sin estado desacoplados por el broker: los consumidores se escalan horizontalmente como *competing consumers* sobre la misma cola. |
-| **Observabilidad** | Métricas Prometheus (`prom-client`), dashboards Grafana, alertas con Alertmanager, trazas OpenTelemetry y logs JSON estructurados (Pino) con `trace_id`/`span_id`. |
-| **Calidad** | Pruebas unitarias, de integración, E2E y de caos con Jest; pruebas de carga y estrés con Autocannon. |
+The gateway stays on the critical path only for the database commit. Downstream notification, audit, and integration work happens off the request. That split is what keeps ingestion latency stable when consumers slow down, and what prevents a lost event when RabbitMQ is unavailable at the moment of the write.
 
-## Casos de uso
+## Key Architectural Highlights
 
-- **Integración fiable entre microservicios**: publicar eventos de dominio (`product.created`, `order.created`…) sin perderlos aunque el broker o el servicio caigan.
-- **Procesamiento en segundo plano**: notificaciones, auditoría, sincronización con sistemas externos o análisis sin bloquear la respuesta HTTP.
-- **Sistemas que toleran duplicados**: entrega *at-least-once* con idempotencia, adecuada para pagos, pedidos o inventario.
-- **Referencia técnica**: base para estudiar Outbox, DLQ, reintentos, circuit breakers y observabilidad de extremo a extremo.
+- **Write path under concurrency.** `POST /products` persists the product and an `OutboxMessage` in a single Prisma transaction. The HTTP response is returned after commit, so a broker outage cannot drop an event that the client was told succeeded.
+- **Decoupled throughput.** The outbox poller, the `events_queue` consumer, the notification consumer, and the DLX auditor are separate processes. Each can be scaled without scaling the gateway. Notification delivery uses its own queue and a `product.*` binding, so it receives a copy of the event instead of competing with the primary consumer.
+- **Bounded failure.** Recoverable consumer errors are republished to TTL retry queues at 5s, 10s, and 20s, then returned to the topic exchange. After the retry budget, the message is published to `eventflow.events.dlx` / `events_queue_dlq` and acknowledged only after that publish is confirmed. The DLX auditor stores the payload, headers, routing key, and attempt count in `DeadLetterAudit` for replay.
+- **Duplicate safety.** Delivery is at-least-once. Consumers claim an idempotency key in Redis with `SET NX` and a TTL, and fall back to a PostgreSQL `IdempotencyRecord` when Redis is unavailable. A redelivered message is acknowledged and skipped.
+- **Backpressure and protection.** Redis backs a distributed rate limit on the gateway (default 100 requests / 60s per client). A circuit breaker wraps database calls in the product service and opens after a sustained error rate, so a failing PostgreSQL does not pile up in-flight requests.
+- **Operable by default.** Every process exposes Prometheus metrics. Grafana loads two dashboards on startup. Alertmanager receives rules for an open circuit breaker, worker and notification error rate above 10%, a non-empty DLQ, and saturated retry queues.
 
-## Stack tecnológico
+## Architecture Diagram (Mermaid)
 
-| Capa | Tecnología |
-|---|---|
-| Lenguaje y runtime | Node.js ≥ 20, TypeScript 5 (ESM, `NodeNext`) |
-| API | Fastify 5 (gateway); middleware de *rate limiting* con `rate-limiter-flexible` |
-| Persistencia | PostgreSQL 16 + Prisma ORM 6 |
-| Mensajería | RabbitMQ 3 (`amqplib`), exchange `topic`, colas de reintento con TTL y DLX |
-| Caché / locks / límites | Redis 7 (`ioredis`) |
-| Validación | Zod |
-| Observabilidad | Prometheus, Grafana, Alertmanager, OpenTelemetry, Pino |
-| Contenedores | Docker, Docker Compose (local y producción) |
-| Pruebas | Jest, ts-jest, Autocannon |
-| CI | GitHub Actions |
+```mermaid
+flowchart LR
+  subgraph clients [Clients]
+    HTTP[HTTP clients]
+  end
 
-## Estructura del monorepo
+  subgraph edge [Edge]
+    GW[api-gateway<br/>Fastify :3002<br/>metrics :4004]
+  end
 
-El repositorio es plano: todos los workspaces cuelgan directamente de la raíz.
+  subgraph data [Data plane]
+    PG[(PostgreSQL 16<br/>Product, OutboxMessage,<br/>OutboxEvent, IdempotencyRecord,<br/>DeadLetterAudit)]
+    RD[(Redis 7<br/>rate limit + idempotency locks)]
+  end
 
-```text
-.
-├── apps/
-│   ├── api-gateway/            # API HTTP (Fastify): /events, /products, /health, /metrics
-│   ├── event-workers/          # Outbox Poller, consumidor principal y consumidor DLX
-│   └── notification-service/   # Consumidor independiente de notificaciones
-├── packages/
-│   ├── common/                 # Logger, trazas, esquemas Zod, errores, circuit breaker
-│   ├── database/               # Cliente Prisma y schema PostgreSQL
-│   └── event-bus/              # Cliente RabbitMQ y topología
-├── scripts/                    # seed, replay de DLQ, pruebas de carga y estrés
-├── tests/integration/          # Integración, E2E y caos
-├── prometheus/ grafana/ alertmanager/   # Configuración de observabilidad
-├── docker-compose.yml          # Infraestructura local
-├── docker-compose.prod.yml     # Stack de producción
-├── tsconfig.json               # Type-check completo (incluye tests y scripts)
-└── tsconfig.build.json         # Compilación de producción (solo apps/ y packages/)
+  subgraph workers [Workers]
+    POLL[event-workers<br/>Outbox poller :4001]
+    CONS[event-consumer<br/>events_queue :4002]
+    NTF[notification-service<br/>notifications_queue :4003]
+    DLXA[dlx-auditor<br/>DeadLetterAudit]
+  end
+
+  subgraph broker [RabbitMQ]
+    EX[eventflow.events<br/>topic exchange]
+    Q[events_queue]
+    NQ[notifications_queue<br/>binding product.*]
+    RQ[retry queues<br/>TTL 5s / 10s / 20s]
+    DLX[eventflow.events.dlx]
+    DLQ[events_queue_dlq]
+  end
+
+  subgraph obs [Observability]
+    PROM[Prometheus :9090]
+    AM[Alertmanager :9093]
+    GRAF[Grafana :3001]
+  end
+
+  HTTP -->|POST /products, POST /events| GW
+  GW -->|transaction: business row + outbox| PG
+  GW -->|rate limit| RD
+  POLL -->|claim unpublished rows| PG
+  POLL -->|publisher confirms| EX
+  EX --> Q
+  EX --> NQ
+  Q --> CONS
+  NQ --> NTF
+  CONS -->|idempotency| RD
+  CONS -->|idempotency record| PG
+  NTF -->|idempotency record| PG
+  CONS -->|transient failure| RQ
+  NTF -->|transient failure| RQ
+  RQ -->|TTL expiry| EX
+  CONS -->|retries exhausted| DLX
+  NTF -->|retries exhausted| DLX
+  DLX --> DLQ
+  DLQ --> DLXA
+  DLXA -->|audit row| PG
+
+  GW -->|scrape /metrics| PROM
+  POLL -->|scrape /metrics| PROM
+  CONS -->|scrape /metrics| PROM
+  NTF -->|scrape /metrics| PROM
+  broker -->|rabbitmq_prometheus :15692| PROM
+  PROM --> AM
+  PROM --> GRAF
 ```
 
-Workspaces npm: `apps/*` y `packages/*`. Los paquetes internos se importan por su nombre (`@eventflow/common`, `@eventflow/database`, `@eventflow/event-bus`) y solo exponen su punto de entrada raíz.
+## Design Patterns & Reliability
 
-## Flujo de un evento
+**Transactional Outbox.** The gateway does not publish to RabbitMQ inside the HTTP request. `ProductService` writes the product and an `OutboxMessage` (`published = false`) in one transaction. If the process dies after commit and before publish, the row remains unpublished and the poller retries it. If the transaction rolls back, no event exists. That removes the dual-write window between the database and the broker.
 
-```text
-Cliente ──HTTP──▶ API Gateway ──(transacción)──▶ PostgreSQL [negocio + Outbox]
-                                                      │
-                                         Outbox Poller (event-workers)
-                                                      ▼
-                                      RabbitMQ  (exchange topic)
-                          ┌───────────────┴────────────────┐
-                    Consumidor principal          Notification Service
-                  (idempotente + reintentos)        (idempotente)
-                          │ fallos definitivos
-                          ▼
-                     DLX ▶ DLQ ▶ auditoría / replay
+The process started by `event-workers` polls `OutboxMessage` in batches of 10 every 5 seconds, publishes with a confirm channel, and marks the row published only after the confirm. A second worker module, `outbox-poller.worker.ts`, claims `OutboxEvent` rows with `SELECT … FOR UPDATE SKIP LOCKED` ordered by `createdAt`. That claim is the multi-poller path: two replicas cannot lock the same pending row, and a crash releases the lock with the transaction.
+
+**Eventual consistency.** Callers observe the business write immediately. Consumers observe it after the poller publishes and RabbitMQ delivers. The system is explicit about that lag. Ordering inside a single aggregate is preserved by FIFO polling on `createdAt` and by a single active consumer per queue message. Cross-service reads that must tolerate the lag should key off the event id, not on the assumption that a notification already ran.
+
+**Idempotency.** The broker contract is at-least-once: retries, redeliveries, and poller retries can present the same event more than once. The primary consumer acquires a Redis key (`SET` with `EX` and `NX`, default TTL 24h) before work. A failed Redis call fails open and the PostgreSQL idempotency record remains the source of truth. The notification service records its own idempotency row, so the two consumers can both handle `product.created` exactly once each. A duplicate is acknowledged, counted in `eventflow_events_duplicates_total` or `eventflow_notification_events_duplicates_total`, and not applied again.
+
+**Dead-letter queues.** Manual acknowledgement (`noAck: false`) is mandatory. Success and duplicates are `ack`ed. A recoverable error is published to the next TTL queue and the original message is `ack`ed, so the retry budget lives in `x-death` instead of an infinite requeue. The third failure publishes to the dead-letter exchange and only then acknowledges. A failure to route the retry or the dead letter is `nack(requeue=false)`, which uses the queue's `x-dead-letter-exchange` rather than spinning in place. `scripts/replay-dlx.ts` republishes audited messages back to the main exchange after the defect is fixed.
+
+**Worker queues.** This runtime is Node.js 20, so concurrency is process isolation plus non-blocking I/O, not a thread per request. The compose stack runs four worker roles from two images:
+
+| Process | Role |
+|---|---|
+| `event-workers` | Outbox poller. Reads unpublished rows, confirms publish, exposes `:4001/metrics`. |
+| `event-consumer` | Competing consumer on `events_queue`. Scale this service to add consumers. |
+| `notification-service` | Own queue, `product.*` binding, own idempotency and metrics on `:4003`. |
+| `dlx-auditor` | Reads the DLQ and writes `DeadLetterAudit`. |
+
+Adding a replica of `event-consumer` is a competing-consumer scale-out: RabbitMQ delivers each message to one ready consumer on that queue. The notification service is intentionally not a replica of that queue.
+
+**Connection loss.** The RabbitMQ client reconnects with exponential backoff up to 30 seconds and redeclares the topic exchange, the main queue, the DLQ, and the three TTL retry queues on every successful connect. Publisher confirms mean a publish that did not get a confirm stays unpublished in PostgreSQL.
+
+## Performance & Load Testing Results
+
+The gateway's latency budget is the PostgreSQL transaction, not the consumer pipeline. Downstream retries and dead-letter handling do not sit on the HTTP response. The reference profile for a single gateway instance on the `POST /products` write path is:
+
+| Metric | Reference profile |
+|---|---|
+| Throughput | 10,000 req/s |
+| Latency p99 | < 50 ms |
+| Failed requests | 0% |
+| Packet loss | 0% |
+
+Treat that profile as the acceptance target for a demo host. This repository records results with [Autocannon](https://github.com/mcollina/autocannon), not a checked-in k6 script, and it does not commit a machine-specific benchmark. Capture a fresh summary on the host you cite before you quote the numbers as a measured result.
+
+| Script | What it stresses | Default shape |
+|---|---|---|
+| `npm run stress:api` | `POST /products` with a unique body per request | 50 connections, 30s. Prints req/s, average latency, p99, non-2xx, connection errors. |
+| `npm run load:products` | Constant-rate writes | `RATE` 50, `DURATION` 30s, `CONNECTIONS` 25. Exits non-zero if any request fails or returns non-2xx. |
+| `npm run load:test` | Saturation with pipelining | 100 connections, pipelining 10, 30s. |
+
+```bash
+TARGET_URL=http://localhost:3002/products CONNECTIONS=100 DURATION=30 npm run stress:api
 ```
 
-Detalle completo en [ARCHITECTURE.md](./ARCHITECTURE.md).
+Histogram buckets on `http_request_duration_seconds` are 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2s, and 5s, so a p99 under 50ms is visible on the API gateway dashboard without a custom recording rule.
 
-## Instalación y ejecución local
+## Observability & Monitoring
 
-### Requisitos
+Prometheus scrapes every 5 seconds inside the compose network:
 
-- Node.js **20 o superior** y npm
-- Docker y Docker Compose
+| Job | Target | Signals |
+|---|---|---|
+| `api-gateway` | `api-gateway:4004/metrics` | `http_requests_total`, `http_request_duration_seconds` by method, route, and status, `eventflow_circuit_breaker_state`, Node.js process metrics |
+| `event-workers` | `event-workers:4001/metrics` | `eventflow_outbox_messages_published_total`, `eventflow_outbox_publish_failures_total`, `eventflow_outbox_messages_pending` |
+| `event-consumer` | `event-consumer:4002/metrics` | `eventflow_events_processed_total`, `eventflow_events_duplicates_total`, `eventflow_events_errors_total`, `eventflow_events_retries_total`, `eventflow_events_dead_lettered_total` |
+| `notification-service` | `notification-service:4003/metrics` | `eventflow_notification_events_processed_total`, duplicates, errors, retries |
+| `rabbitmq` | `rabbitmq:15692` | Queue depth, including `events_queue_dlq` and the retry queues |
 
-> En PowerShell de Windows, si la política de ejecución bloquea `npm`, usa `npm.cmd` o Git Bash.
+The same registry also serves gateway HTTP metrics on `:3002/metrics`. Port 4004 is the scrape target because that handler samples the circuit-breaker gauge on each scrape.
 
-### 1. Instalar dependencias
+Grafana starts with the Prometheus datasource and the folder **Eventflow** already provisioned:
+
+- **Eventflow API Gateway Performance** — HTTP throughput, p95/p99 latency, 5xx rate.
+- **Eventflow - Rendimiento de microservicios** — events processed, errors, duplicates, retries, dead-lettered events, and ready messages per queue.
+
+Alert rules in `prometheus/alerts/eventflow-alerts.yml` page through Alertmanager on `:9093`:
+
+- Circuit breaker open for 1 minute.
+- Worker or notification error rate above 10% for 1 minute.
+- `events_queue_dlq` non-empty for 1 minute.
+- Combined retry-queue depth above 100 for 2 minutes.
+
+Logs are structured JSON from Pino. OpenTelemetry hooks are compiled into the gateway and the workers (`traceparent` is propagated on the event). The compose stack sets `OTEL_SDK_DISABLED=true` because it does not run a trace collector; point `OTEL_EXPORTER_OTLP_ENDPOINT` at a collector when you want traces.
+
+## Quick Start Guide (One-Command Deployment)
+
+Requirements: Docker with Compose v2, and a free set of host ports `3001`, `3002`, `4001`–`4004`, `5432`, `5672`, `6379`, `9090`, `9093`, `15672`, `15692`.
 
 ```bash
 git clone https://github.com/Arierutemplar/eventflow-engine.git
 cd eventflow-engine
-npm install
+docker compose up --build
 ```
 
-### 2. Configurar variables de entorno
+Compose builds the multi-stage images for `api-gateway`, `event-workers`, and `notification-service`, creates the `eventflow` bridge network, and starts PostgreSQL, Redis, and RabbitMQ before the application containers. Application services wait on `service_healthy`. Prometheus waits until the gateway, poller, consumer, notification service, broker, and Alertmanager are healthy. Grafana waits on Prometheus and loads the provisioned dashboards.
 
-```bash
-cp .env.example .env        # PowerShell: Copy-Item .env.example .env
-```
+On a machine that already has an older `eventflow_postgres_data` volume, the init SQL does not re-run. Remove that volume first if the schema predates this compose file.
 
-Los valores por defecto coinciden con `docker-compose.yml`. Variables principales:
-
-| Variable | Descripción | Por defecto |
+| Surface | URL | Local credentials |
 |---|---|---|
-| `DATABASE_URL` | Conexión PostgreSQL (la lee Prisma) | `postgresql://eventuser:eventpassword@localhost:5432/eventflow_db?schema=public` |
-| `RABBITMQ_URL` | Conexión AMQP | `amqp://guest:guest@localhost:5672` |
-| `REDIS_URL` | Redis para *rate limiting* e idempotencia distribuida | `redis://localhost:6379` |
-| `API_PORT` | Puerto del API Gateway | `3002` |
-| `LOG_LEVEL` | Nivel de logs Pino | `info` |
-| `SERVICE_NAME` / `OTEL_EXPORTER_OTLP_ENDPOINT` | Trazas OpenTelemetry | ver `.env.example` |
-| `RATE_LIMIT_POINTS` / `RATE_LIMIT_DURATION_SECONDS` | Límite de peticiones | `100` / `60` |
-
-Las pruebas leen `.env.test` (base de datos `eventflow_test`). **No subas `.env` ni `.env.test` al repositorio.**
-
-### 3. Levantar la infraestructura
-
-```bash
-npm run docker:db           # PostgreSQL, Redis y RabbitMQ
-```
-
-Para añadir Prometheus, Grafana y Alertmanager: `docker compose up -d`.
-
-### 4. Generar el cliente Prisma y preparar la base de datos
-
-```bash
-npm run db:generate         # genera el cliente Prisma
-npm run db:push             # sincroniza el schema con la base de datos
-```
-
-`npm run db:migrate` crea y aplica una migración de desarrollo. El historial en `packages/database/prisma/migrations` no cubre todavía todos los modelos del schema (por ejemplo `Product`, `OutboxEvent` o `DeadLetterAudit`), por lo que `db:push` es la vía recomendada en local hasta consolidar las migraciones.
-
-### 5. Compilar
-
-```bash
-npm run build               # tsc -p tsconfig.build.json → dist/
-```
-
-### 6. Ejecutar los servicios
-
-En terminales separadas:
-
-```bash
-npm run dev:gateway         # API Gateway          → http://localhost:3002
-npm run dev:poller          # Outbox Poller        (publica Outbox → RabbitMQ)
-npm run dev:worker          # Consumidor principal (idempotente, con reintentos)
-npm run dev:dlx             # Consumidor DLX       (auditoría de mensajes fallidos)
-npm run dev:notifications   # Servicio de notificaciones
-```
-
-Para ejecutar el gateway compilado: `npm run build && npm start`.
-
-### 7. Probar la API
+| API Gateway | http://localhost:3002/health | — |
+| RabbitMQ management | http://localhost:15672 | `guest` / `guest` |
+| Prometheus | http://localhost:9090 | — |
+| Alertmanager | http://localhost:9093 | — |
+| Grafana | http://localhost:3001 | `admin` / `admin` |
 
 ```bash
 curl http://localhost:3002/health
 
 curl -X POST http://localhost:3002/products \
   -H "content-type: application/json" \
-  -d '{"name":"Teclado","price":2500,"status":"ACTIVE"}'
+  -d '{"name":"Keyboard","price":2500,"status":"ACTIVE"}'
 ```
 
-| Método | Ruta | Descripción |
-|---|---|---|
-| `GET` | `/health` | Estado del servicio |
-| `GET` | `/metrics` | Métricas Prometheus |
-| `POST` | `/events` | Valida un evento y responde `202 Accepted` |
-| `POST` | `/products` | Crea un producto y su evento Outbox (`price` entero ≥ 0) |
-| `GET` | `/products` | Lista productos |
+`POST /products` returns after the product and its outbox row commit. Within one poll interval the poller publishes `product.created`, the event consumer and the notification service each handle it once, and the gateway, worker, and queue panels in Grafana move.
 
-Puertos locales: Gateway `3002`, RabbitMQ UI `15672`, Prometheus `9090`, Grafana `3001`, Alertmanager `9093`. Métricas por proceso: gateway `4004`, Outbox Poller `4001`, consumidor `4002`, notificaciones `4003`.
+These credentials and the guest RabbitMQ account exist so the stack boots with one command. `docker-compose.prod.yml` is the variant that reads `POSTGRES_*`, `RABBITMQ_*`, and `GRAFANA_*` from the environment. Do not publish this default compose file onto a shared network.
 
-## Pruebas
-
-```bash
-npm test                    # Jest (todas las suites; las de integración usan DATABASE_URL, por eso
-                            # conviene ejecutar antes `npm run db:push` o usar test:integration)
-npm run test:integration    # sincroniza el schema de pruebas y ejecuta tests/integration
-npm run test:e2e            # E2E con PostgreSQL y RabbitMQ reales (.env.test)
-```
-
-Las pruebas de integración y E2E requieren la infraestructura levantada (paso 3).
-
-## Scripts de carga, estrés y operación
-
-| Comando | Propósito |
-|---|---|
-| `npm run stress:api` | Autocannon contra `POST /products` (`TARGET_URL`, `PORT`, `CONNECTIONS`, `DURATION`) |
-| `npm run load:products` | Carga a ritmo constante (`RATE`, `DURATION`, `CONNECTIONS`); falla si hay errores o respuestas non-2xx |
-| `npm run load:test` | Prueba de saturación con *pipelining* |
-| `npm run replay:dlx` | Republica mensajes de la DLQ (`REPLAY_LIMIT`) |
-| `npm run db:seed` | Inserta un evento de prueba en el Outbox |
-| `npm run db:studio` | Prisma Studio |
-| `npm run clean` | Elimina `dist/` |
-
-## Producción
-
-`docker-compose.prod.yml` construye las imágenes de `api-gateway` y `event-workers` (Dockerfile multietapa, usuario no root) junto a PostgreSQL, RabbitMQ, Prometheus y Grafana. Las credenciales se leen de `.env` (variables `POSTGRES_*`, `RABBITMQ_*`, `GRAFANA_*`).
-
-```bash
-./deploy-prod.sh            # Linux/macOS
-./deploy-prod.ps1           # Windows PowerShell
-```
-
-El pipeline de [GitHub Actions](./.github/workflows/ci.yml) instala dependencias, genera el cliente Prisma, comprueba tipos, compila y ejecuta las pruebas de integración contra PostgreSQL y RabbitMQ.
-
-## Documentación adicional
-
-- [ARCHITECTURE.md](./ARCHITECTURE.md): componentes, topología RabbitMQ, idempotencia, circuit breaker, pools de Prisma y observabilidad.
+Component-level detail, the RabbitMQ topology, and the test matrix live in [ARCHITECTURE.md](./ARCHITECTURE.md).

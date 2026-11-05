@@ -1,105 +1,341 @@
-version: '3.8'
+# Full EventFlow stack. Local credentials are intentional for one-command startup.
+# Replace them before exposing this compose file beyond a private machine.
+# docker-compose.prod.yml is the credentialized production variant.
+
+x-app-env: &app-env
+  NODE_ENV: production
+  LOG_LEVEL: info
+  DATABASE_URL: postgresql://eventuser:eventpassword@postgres:5432/eventflow_db?schema=public&connection_limit=10&pool_timeout=10
+  RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+  REDIS_URL: redis://redis:6379
+  OTEL_SDK_DISABLED: "true"
+
+x-app-health: &node-health
+  interval: 10s
+  timeout: 5s
+  retries: 12
+  start_period: 20s
 
 services:
-  # Base de Datos Relacional Principal
   postgres:
     image: postgres:16-alpine
     container_name: eventflow_postgres
-    restart: always
+    restart: unless-stopped
     environment:
       POSTGRES_USER: eventuser
       POSTGRES_PASSWORD: eventpassword
       POSTGRES_DB: eventflow_db
     ports:
-      - '5432:5432'
+      - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - eventflow_postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U eventuser -d eventflow_db"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U eventuser -d eventflow_db && psql -U eventuser -d eventflow_db -c 'SELECT 1 FROM \"Product\" LIMIT 1'",
+        ]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 20
+      start_period: 10s
+    networks:
+      - eventflow
 
-  # In-Memory Cache, Rate Limiting y Bloqueos Distribuidos
   redis:
     image: redis:7-alpine
     container_name: eventflow_redis
-    restart: always
+    restart: unless-stopped
     command: redis-server --save 60 1 --loglevel notice
     ports:
-      - '6379:6379'
+      - "6379:6379"
     volumes:
-      - redis_data:/data
+      - eventflow_redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 5s
+    networks:
+      - eventflow
 
-  # Message Broker con Interfaz Web de Gestión
   rabbitmq:
     image: rabbitmq:3-management-alpine
     container_name: eventflow_rabbitmq
-    restart: always
+    restart: unless-stopped
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
     ports:
-      - '5672:5672'   # AMQP Protocol
-      - '15672:15672' # Management Dashboard
-      - '15692:15692' # Prometheus metrics
+      - "5672:5672"
+      - "15672:15672"
+      - "15692:15692"
     command: >-
-      sh -c "rabbitmq-plugins enable --offline rabbitmq_prometheus &&
+      sh -c "printf '%s\n' 'loopback_users.guest = false' > /etc/rabbitmq/rabbitmq.conf &&
+      rabbitmq-plugins enable --offline rabbitmq_prometheus &&
       rabbitmq-server"
     volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
+      - eventflow_rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 10s
-      timeout: 5s
-      retries: 5
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    networks:
+      - eventflow
 
-  # Monitorización de Métricas
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: eventflow_prometheus
-    restart: always
+  api-gateway:
+    build:
+      context: .
+      dockerfile: apps/api-gateway/Dockerfile
+      target: runner
+    image: eventflow-api-gateway:local
+    container_name: eventflow_api_gateway
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      SERVICE_NAME: api-gateway
+      API_PORT: 3002
+      GATEWAY_METRICS_PORT: 4004
+      RATE_LIMIT_POINTS: 100
+      RATE_LIMIT_DURATION_SECONDS: 60
     ports:
-      - '9090:9090'
-    volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
-      - ./prometheus/alerts:/etc/prometheus/alerts
-      - prometheus_data:/prometheus
+      - "3002:3002"
+      - "4004:4004"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      <<: *node-health
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3002/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+    networks:
+      - eventflow
 
-  # Gestión de alertas de Prometheus
+  event-workers:
+    build:
+      context: .
+      dockerfile: apps/event-workers/Dockerfile
+      target: runner
+    image: eventflow-event-workers:local
+    container_name: eventflow_outbox_poller
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      SERVICE_NAME: event-workers
+      METRICS_PORT: 4001
+    ports:
+      - "4001:4001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      <<: *node-health
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:4001/metrics').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+    networks:
+      - eventflow
+
+  event-consumer:
+    build:
+      context: .
+      dockerfile: apps/event-workers/Dockerfile
+      target: runner
+    image: eventflow-event-workers:local
+    container_name: eventflow_event_consumer
+    restart: unless-stopped
+    command: ["node", "dist/apps/event-workers/src/consumers/event.consumer.js"]
+    environment:
+      <<: *app-env
+      SERVICE_NAME: event-consumer
+      CONSUMER_METRICS_PORT: 4002
+      RABBITMQ_QUEUE: events_queue
+    ports:
+      - "4002:4002"
+    depends_on:
+      event-workers:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      <<: *node-health
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:4002/metrics').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+    networks:
+      - eventflow
+
+  dlx-auditor:
+    build:
+      context: .
+      dockerfile: apps/event-workers/Dockerfile
+      target: runner
+    image: eventflow-event-workers:local
+    container_name: eventflow_dlx_auditor
+    restart: unless-stopped
+    command: ["node", "dist/apps/event-workers/src/dlx-consumer.js"]
+    environment:
+      <<: *app-env
+      SERVICE_NAME: dlx-auditor
+    depends_on:
+      event-workers:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - eventflow
+
+  notification-service:
+    build:
+      context: .
+      dockerfile: apps/notification-service/Dockerfile
+      target: runner
+    image: eventflow-notification-service:local
+    container_name: eventflow_notification_service
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      SERVICE_NAME: notification-service
+      METRICS_PORT: 4003
+    ports:
+      - "4003:4003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      <<: *node-health
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:4003/metrics').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+    networks:
+      - eventflow
+
   alertmanager:
     image: prom/alertmanager:latest
     container_name: eventflow_alertmanager
-    restart: always
+    restart: unless-stopped
     ports:
-      - '9093:9093'
+      - "9093:9093"
     volumes:
-      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml
-      - alertmanager_data:/alertmanager
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - eventflow_alertmanager_data:/alertmanager
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9093/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - eventflow
 
-  # Dashboard Visualizador de Infraestructura
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: eventflow_prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.stack.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts:/etc/prometheus/alerts:ro
+      - eventflow_prometheus_data:/prometheus
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+      event-workers:
+        condition: service_healthy
+      event-consumer:
+        condition: service_healthy
+      notification-service:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      alertmanager:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    networks:
+      - eventflow
+
   grafana:
     image: grafana/grafana:latest
     container_name: eventflow_grafana
-    restart: always
-    ports:
-      - '3001:3000'
+    restart: unless-stopped
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    ports:
+      - "3001:3000"
     volumes:
-      - grafana_data:/var/lib/grafana
-      - ./grafana/provisioning:/etc/grafana/provisioning
-      - ./grafana/dashboards:/var/lib/grafana/dashboards
+      - eventflow_grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    networks:
+      - eventflow
+
+networks:
+  eventflow:
+    name: eventflow
+    driver: bridge
 
 volumes:
-  postgres_data:
-  redis_data:
-  rabbitmq_data:
-  prometheus_data:
-  grafana_data:
-  alertmanager_data:
+  eventflow_postgres_data:
+  eventflow_redis_data:
+  eventflow_rabbitmq_data:
+  eventflow_prometheus_data:
+  eventflow_grafana_data:
+  eventflow_alertmanager_data:
